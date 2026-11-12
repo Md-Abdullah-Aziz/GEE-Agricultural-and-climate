@@ -1,0 +1,290 @@
+// Tapas - The Relative Humidity Explorer
+// Relative humidity estimated from ERA5-Land hourly 2 m temperature
+// and 2 m dewpoint temperature. Asset must contain a "District" field.
+
+var mapPanel = ui.Map();
+
+var mainPanel = ui.Panel({
+  style: {
+    width: '500px',
+    border: '3px solid #888'
+  }
+});
+
+var title = ui.Label({
+  value: 'Tapas - The RH Explorer',
+  style: {
+    fontSize: '35px',
+    fontFamily: 'serif',
+    color: 'd10901',
+    margin: '0 auto',
+    padding: '10px'
+  }
+});
+
+var subTitle = ui.Label({
+  value: 'Average relative humidity for different districts of West Bengal for 2023.',
+  style: {
+    fontSize: '15px',
+    margin: '8px 0',
+    padding: '0 10px'
+  }
+});
+
+var dataSource = ui.Label({
+  value: 'Data Source: ERA5-Land Hourly, ECMWF/Copernicus',
+  style: {
+    fontSize: '13px',
+    color: '0502ce',
+    fontFamily: 'serif',
+    margin: '8px 0',
+    padding: '0 30px'
+  }
+});
+
+var distPanel = ui.Panel();
+var chartPanel = ui.Panel();
+
+var note = ui.Label({
+  value: 'Relative humidity is calculated from air temperature and dewpoint temperature using the Magnus formula. The series shows daily mean RH; ERA5-Land is a model reanalysis product at approximately 9 km resolution.',
+  style: {
+    fontSize: '14px',
+    padding: '0 10px'
+  }
+});
+
+var credit = ui.Label({
+  value: 'Developed by Somdeep Kundu',
+  style: {
+    fontSize: '13px',
+    color: 'c21301',
+    fontFamily: 'serif',
+    padding: '0 10px'
+  }
+});
+
+var dedication = ui.Label({
+  value: 'Article 51A(h), Indian Constitution — “It shall be the duty of every citizen of India to develop the scientific temper, humanism and the spirit of inquiry and reform.”',
+  style: {
+    fontSize: '11.5px',
+    color: 'black',
+    fontFamily: 'serif',
+    textAlign: 'right',
+    padding: '0 10px'
+  }
+});
+
+mainPanel.add(title);
+mainPanel.add(subTitle);
+mainPanel.add(dataSource);
+mainPanel.add(distPanel);
+mainPanel.add(chartPanel);
+
+var splitPanel = ui.SplitPanel({
+  firstPanel: mapPanel,
+  secondPanel: mainPanel
+});
+
+ui.root.clear();
+ui.root.add(splitPanel);
+
+
+// -------------------- DATA --------------------
+
+// Hourly ERA5-Land data for 2023.
+// Temperature bands are in Kelvin.
+var era5Hourly = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+  .filterDate('2023-01-01', '2024-01-01')
+  .select(['temperature_2m', 'dewpoint_temperature_2m']);
+
+// Saturation vapour pressure (Magnus formula), with temperatures in Celsius.
+function addRelativeHumidity(image) {
+  var temperatureC = image.select('temperature_2m').subtract(273.15);
+  var dewpointC = image.select('dewpoint_temperature_2m').subtract(273.15);
+
+  var es = temperatureC.expression(
+    '6.112 * exp((17.67 * T) / (T + 243.5))',
+    {T: temperatureC}
+  );
+
+  var e = dewpointC.expression(
+    '6.112 * exp((17.67 * Td) / (Td + 243.5))',
+    {Td: dewpointC}
+  );
+
+  var rh = e.divide(es).multiply(100).clamp(0, 100)
+    .rename('RH');
+
+  return rh.copyProperties(image, ['system:time_start']);
+}
+
+var rhHourly = era5Hourly.map(addRelativeHumidity);
+
+// Daily means reduce chart volume while retaining a time series.
+var dayCount = ee.Date('2024-01-01')
+  .difference(ee.Date('2023-01-01'), 'day');
+
+var days = ee.List.sequence(0, dayCount.subtract(1));
+
+var rhDaily = ee.ImageCollection.fromImages(
+  days.map(function(dayOffset) {
+    var start = ee.Date('2023-01-01').advance(dayOffset, 'day');
+    var dailyMean = rhHourly
+      .filterDate(start, start.advance(1, 'day'))
+      .mean()
+      .set('system:time_start', start.millis());
+
+    return dailyMean;
+  })
+);
+
+// District boundaries (same asset as the supplied app).
+var wbDist = ee.FeatureCollection(
+  'projects/ee-project-tapas/assets/wbDist'
+);
+
+var distNames = wbDist.aggregate_array('District');
+
+distNames.evaluate(function(names) {
+  var distDropdown = ui.Select({
+    placeholder: 'Select a District/জেলা',
+    items: names,
+    onChange: display,
+    style: {
+      color: '053061',
+      margin: '0 auto',
+      width: '88%'
+    }
+  });
+
+  distPanel.add(distDropdown);
+});
+
+
+// -------------------- DISTRICT DISPLAY --------------------
+
+function display(distName) {
+  var selected = ee.Feature(
+    wbDist.filter(ee.Filter.eq('District', distName)).first()
+  );
+  var districtGeometry = selected.geometry();
+
+  mapPanel.clear();
+
+  mapPanel.addLayer(
+    districtGeometry,
+    {color: 'grey'},
+    distName,
+    true
+  );
+
+  // District daily mean RH time series.
+  var chart = ui.Chart.image.series({
+    imageCollection: rhDaily,
+    region: districtGeometry,
+    reducer: ee.Reducer.mean(),
+    scale: 10000,
+    xProperty: 'system:time_start'
+  }).setOptions({
+    title: 'Daily Relative Humidity for ' + distName + ' District',
+    titleTextStyle: {bold: true, color: '04028b'},
+    interpolateNulls: true,
+    pointSize: 0,
+    lineWidth: 1,
+    hAxis: {
+      title: 'Date',
+      format: 'MMM',
+      gridlines: {color: 'eeeeee'}
+    },
+    vAxis: {
+      title: 'Relative Humidity (%)',
+      viewWindow: {min: 0, max: 100},
+      gridlines: {color: 'eeeeee'}
+    },
+    series: {
+      0: {color: '0502ce'}
+    },
+    chartArea: {backgroundColor: 'EBEBEB'}
+  });
+
+  chartPanel.clear();
+  chartPanel.add(chart);
+  chartPanel.add(note);
+  chartPanel.add(credit);
+  chartPanel.add(dedication);
+
+  // Annual mean RH map, clipped to the selected district.
+  var annualMeanRH = rhHourly.mean().rename('RH');
+  var rhVis = {
+    min: 30,
+    max: 100,
+    palette: [
+      '8c2d04', 'cc4c02', 'ec7014', 'fe9929',
+      'fec44f', 'fff7bc', 'c7e9c0', '41b6c4',
+      '2c7fb8', '253494'
+    ]
+  };
+
+  mapPanel.addLayer(
+    annualMeanRH.clip(districtGeometry),
+    rhVis,
+    'Annual Mean Relative Humidity (%)'
+  );
+
+  mapPanel.centerObject(districtGeometry);
+  mapPanel.setOptions('HYBRID');
+
+  // Map legend.
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-right',
+      backgroundColor: 'rgba(255,255,255,0.85)',
+      padding: '8px'
+    }
+  });
+
+  legend.add(ui.Label({
+    value: 'Relative Humidity (%)',
+    style: {fontWeight: 'bold', fontSize: '14px'}
+  }));
+
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select('latitude')
+      .visualize({
+        min: -90,
+        max: 90,
+        palette: rhVis.palette
+      }),
+    params: {bbox: '0,0,10,100', dimensions: '20x160'},
+    style: {height: '160px', width: '20px'}
+  });
+
+  var legendLabels = ui.Panel({
+    widgets: [
+      ui.Label('100%'),
+      ui.Label(''),
+      ui.Label(''),
+      ui.Label(''),
+      ui.Label('30%')
+    ],
+    style: {margin: '0 0 0 6px'}
+  });
+
+  legend.add(ui.Panel({
+    widgets: [colorBar, legendLabels],
+    layout: ui.Panel.Layout.flow('horizontal')
+  }));
+
+  mapPanel.add(legend);
+}
+
+
+// Initial map view and West Bengal district outlines.
+mapPanel.setCenter(88.4, 24.4, 7);
+
+var wbDistDrawn = wbDist.draw({
+  color: 'd10901',
+  strokeWidth: 2
+});
+
+mapPanel.addLayer(wbDistDrawn, {}, 'West Bengal districts');
